@@ -1,0 +1,8 @@
+# Baseline used for reproducible API behavior. Python 3.11 and Java 17 recommended.
+pyspark==3.5.7
+ray[default,data]==2.49.2
+pyarrow==19.0.1
+pandas==2.2.3
+numpy==2.2.6
+psutil==7.0.0
+matplotlib>=3.9,<4

@@ -1,6 +1,6 @@
 # DA3408 Assignment 3: Spark vs. Ray
 
-Two equivalent taxi preprocessing pipelines designed for a laptop with roughly 8 GB RAM. Both stage cleaned rows into deterministic disk buckets, then deduplicate, perform two distributed zone joins, run the shared Python speed function, and export Snappy Parquet one bucket at a time. All staging I/O is included in end-to-end timing.
+Two equivalent taxi preprocessing pipelines for Spark and Ray Data. Both stage cleaned rows into deterministic disk buckets, deduplicate exact normalized trip rows, enrich pickup/drop-off IDs from the zone table, calculate duration/hour/speed, and export Snappy Parquet. All staging I/O is included in end-to-end timing.
 
 ## 1. Existing Conda environment
 
@@ -16,13 +16,13 @@ Python 3.11 and Java 17 are recommended. Install matching requirements on every 
 
 ## 2. Data
 
-January and February 2023 are already present under `data/raw/trips/`, with the zone CSV at `data/raw/taxi_zone_lookup.csv`. Together those two months are about 95 MB, a development subset rather than the full 2 GB benchmark.
+The downloaded set is under `data/raw/trips/`, with the zone CSV at `data/raw/taxi_zone_lookup.csv`. The timed Spark/Ray pair uses the first four sorted whole Parquet files (Jan–Apr 2023), about 0.345 GB uncompressed, to keep both runs within a 30-minute budget on the available laptop. The rest of the downloaded data stays unchanged.
 
 ```bash
 # Preserve and validate existing files; download only missing files.
 python download_data.py --months 2023-01 2023-02
 
-# Later, extend with real monthly files until total downloaded trip bytes reach 2 GB.
+# The benchmark run uses --max-uncompressed-gb 0.35 for a deterministic four-file prefix.
 python download_data.py --target-gb 2
 ```
 
@@ -62,11 +62,15 @@ python ray_clean.py --address auto --run-id ray01
 
 Outputs are `data/output/spark/spark01/` and `data/output/ray/ray01/`. Staging is `data/staging/FRAMEWORK/RUN_ID/`. New run IDs are required for every trial; existing directories are never overwritten.
 
-Defaults: 8,192 rows per batch, 16 MiB target blocks, two concurrent tasks, eight shuffle partitions per bucket. The bucket count is automatically chosen from input row count and the 128 MiB estimated bucket budget, with a minimum of 128. Thus both frameworks select the same bucket count for the same files. Set `--buckets N` to override it. The per-bucket guard estimates 512 bytes per cleaned row; it is not an enforced memory cap. Increase the bucket count if the guard fails or a join runs out of memory. More buckets trade memory for disk I/O, scheduling and small-file overhead.
+Defaults: 32,768 rows per batch, 32 MiB target blocks, two concurrent tasks, and a 512 MiB estimated per-bucket budget. The bucket count is automatically chosen from input row count and the budget, with a minimum of 128. Both frameworks therefore select the same count for the same inputs. Set `--buckets N` to override it. The guard estimates 512 bytes per cleaned row; it is not an enforced limit on decoder, Python, Ray, or JVM memory.
 
-Ray materializes only the current bucket's deduplication and join stages, sequentially, to avoid several shuffle actor pools running simultaneously. Buckets with no matching zones are skipped. This per-bucket materialization is included in its end-to-end timing.
+Use `--max-uncompressed-gb N` to select a deterministic sorted prefix of complete Parquet files whose uncompressed row-group metadata fits within N decimal GB. The selected paths, row counts and compressed/uncompressed byte counts are recorded in `_run.json`. Use the same cap for Spark and Ray when comparing a bounded subset.
 
-Both supplied months have one large row group and different physical integer types. Spark reads each file separately and casts before unioning it. Ray uses `StreamingTaxiParquet`, a Ray Data datasource backed by `ParquetFile.iter_batches`, rather than allocating a whole monthly table. Decoder buffers and task/runtime overhead can still exceed batch size. Avoid full-dataset `collect()`, `to_pandas()`, `materialize()` or caching.
+Ray creates one bounded streaming read task per bucket. Each task reads that bucket's fragments, deduplicates exactly on all normalized source columns in pandas, then yields bounded Arrow batches for vectorized zone enrichment and feature export. This makes the 128 independent buckets run in parallel across the two workers, without a large global shuffle or repeated dataset-plan startup. Spark reads the staged bucket files in one plan, deduplicates in its distributed DataFrame plan, broadcasts the small zone dimension for both lookups, and exports bucket-partitioned Parquet.
+
+The current Docker setup gives the Ray workers two CPUs each; the run command limits pipeline concurrency to two to reduce OOM risk while keeping both workers active. See `runner.md` for cluster commands, monitoring, recovery, and measured-run ordering.
+
+The downloaded TLC months have large row groups and may have different physical integer types. Spark reads each file separately and casts before unioning it. Ray uses `StreamingTaxiParquet`, a Ray Data datasource backed by `ParquetFile.iter_batches`, rather than allocating a whole monthly table. Decoder buffers and task/runtime overhead can still exceed batch size. Avoid full-dataset `collect()`, `to_pandas()`, `materialize()` or caching.
 
 Temporary files remain for inspection; remove only your completed run's staging manually when no longer needed. Keep one output pair initially, and check available disk before repeated full-data runs.
 
@@ -74,9 +78,9 @@ Temporary files remain for inspection; remove only your completed run's staging 
 
 - Project the same nine columns, discard null/NaN/infinite values, reject nonintegral/out-of-range integer fields, nonpositive distance and nonpositive duration.
 - Integer fields must fit signed 32-bit values and are stored as int64. Timestamps are naive TLC wall times at microsecond precision, limited to `[1678-01-01, 2262-01-01)`; timezone-aware inputs are rejected. Negative zero becomes positive zero.
-- Duplicate identity is all nine normalized trip columns. SHA-256 of their canonical serialization selects a bucket, independently of filename or process hash seed. Duplicate equality uses the complete values, not just a hash. Both frameworks call the same batch normalization function.
+- Duplicate identity is all nine normalized trip columns. A fixed-key, vectorized pandas 64-bit hash routes each normalized row to a bucket. Exact deduplication still compares every source column, so different trip values never merge because of a hash collision.
 - Validate unique lookup IDs. Inner join pickup/drop-off IDs; unmatched trips are discarded. Export joined borough/zone fields, duration, pickup hour and speed rounded with the same Python function to six decimal places.
-- Both joins use a distributed shuffle. Spark broadcast joins and adaptive execution are disabled for this baseline. The zone table is small: describe this honestly as a large-trip-table/zone-lookup shuffle workload, rather than claiming both join inputs are large.
+- The zone table is small. Spark uses explicit broadcast joins; Ray uses equivalent vectorized Arrow lookup operations rather than redistributing the large trip side. Describe this honestly as large-fact-to-small-dimension enrichment, not a join between two large tables.
 
 ```bash
 python validate_outputs.py \

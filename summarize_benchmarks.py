@@ -57,11 +57,12 @@ def main():
             raise ValueError("A run was listed twice.")
         identities.add(identity)
         signature = (metadata["contract"], metadata["input_manifest"], metadata["lookup_sha256"], metadata["output_rows"],
-                     {k: metadata["configuration"][k] for k in ["buckets", "batch_rows", "block_mib", "shuffle_partitions", "concurrency"]})
+                     {k: metadata["configuration"][k] for k in ["buckets", "batch_rows", "shuffle_partitions", "concurrency"]})
         if reference is not None and signature != reference:
             raise ValueError("Runs have different data, cleaning contracts or memory settings.")
         reference = signature
         row = {key: metadata[key] for key in ["framework", "run_id", "input_bytes", "output_rows", "total_seconds"]}
+        row["block_mib"] = metadata["configuration"]["block_mib"]
         row.update(resource_peaks(metadata, args.resources, args.worker_nodes or []))
         rows.append(row)
         groups[row["framework"]].append(row["total_seconds"])

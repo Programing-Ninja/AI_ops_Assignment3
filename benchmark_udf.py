@@ -53,13 +53,17 @@ def run_ray(args, buckets):
     import ray
     from ray.data.aggregate import Sum
     from ray_clean import connect_ray
+    from ray_clean import StreamingTaxiParquet
     connect_ray(args)
     results = []
     try:
         for paths in buckets:
-            frame = ray.data.read_parquet([str(path) for path in paths],
-                                          columns=["trip_distance", "duration_seconds"],
-                                          concurrency=args.concurrency).materialize()
+            frame = ray.data.read_datasource(
+                StreamingTaxiParquet(paths, args.batch_rows,
+                                     columns=["trip_distance", "duration_seconds"],
+                                     schema_kind="output"),
+                concurrency=args.concurrency,
+                override_num_blocks=max(1, len(paths))).materialize()
             for trial in range(args.repeats + 1):
                 values = {}
                 for mode in (["baseline", "udf"] if trial % 2 == 0 else ["udf", "baseline"]):
@@ -92,27 +96,33 @@ def main():
     cli.add_argument("--address", default="auto")
     cli.add_argument("--allow-local", action="store_true")
     cli.add_argument("--repeats", type=int, default=3)
+    cli.add_argument("--max-buckets", type=int, default=8,
+                     help="Profile the first non-empty output buckets to keep the diagnostic bounded")
     cli.add_argument("--batch-rows", type=int, default=8192)
     cli.add_argument("--block-mib", type=int, default=16)
     cli.add_argument("--shuffle-partitions", type=int, default=8)
     cli.add_argument("--concurrency", type=int, default=2)
     args = cli.parse_args()
-    if min(args.repeats, args.batch_rows, args.block_mib, args.shuffle_partitions, args.concurrency) <= 0:
+    if min(args.repeats, args.max_buckets, args.batch_rows, args.block_mib,
+           args.shuffle_partitions, args.concurrency) <= 0:
         cli.error("Sizing and repeat parameters must be positive")
     if args.report.exists():
         raise FileExistsError(f"Refusing to overwrite {args.report}")
     metadata = json.loads((args.input / "_run.json").read_text())
     if metadata["status"] != "complete" or metadata["output_rows"] <= 0:
         raise ValueError("Input must be a completed pipeline run with at least one output row.")
+    args.buckets = metadata["configuration"]["buckets"]
     buckets = [parquet_files(path) for path in sorted(args.input.glob("bucket=*"))]
     buckets = [paths for paths in buckets if paths and parquet_rows(paths) > 0]
+    buckets = buckets[:args.max_buckets]
     results = run_spark(args, buckets) if args.framework == "spark" else run_ray(args, buckets)
     totals = [{"trial": trial, "baseline_seconds": sum(r["baseline_seconds"] for r in results if r["trial"] == trial),
                "udf_seconds": sum(r["udf_seconds"] for r in results if r["trial"] == trial)}
               for trial in range(1, args.repeats + 1)]
     report = {"framework": args.framework, "source_run": metadata["run_id"],
               "benchmark_eligible": not args.allow_local and metadata["benchmark_eligible"],
-              "method": "Per-bucket cached input; one warm-up; alternating native sum baseline and Python speed sum. "
+              "method": f"First {len(buckets)} non-empty buckets; per-bucket cached input; one warm-up; "
+                        "alternating native sum baseline and Python speed sum. "
                         "Stage times include scheduling, serialization and aggregation; not isolated JVM overhead.",
               "trials": totals, "bucket_measurements": results,
               "median_udf_seconds": statistics.median(r["udf_seconds"] for r in totals),

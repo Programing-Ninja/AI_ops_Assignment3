@@ -1,0 +1,30 @@
+FROM ubuntu:22.04
+
+ARG TAXI_UID=1000
+ARG TAXI_GID=1000
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid "${TAXI_GID}" taxi \
+    && useradd --uid "${TAXI_UID}" --gid "${TAXI_GID}" \
+       --create-home --shell /bin/bash taxi
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV SPARK_HOME=/home/harshvardhan/miniconda3/envs/aiops/lib/python3.11/site-packages/pyspark
+ENV PATH=/home/harshvardhan/miniconda3/envs/aiops/bin:/home/harshvardhan/miniconda3/envs/aiops/lib/python3.11/site-packages/pyspark/bin:${PATH}
+ENV PYSPARK_PYTHON=/home/harshvardhan/miniconda3/envs/aiops/bin/python
+ENV SPARK_DAEMON_MEMORY=128m
+ENV SPARK_LOCAL_DIRS=/scratch/spark-local
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+ENV RAY_USAGE_STATS_ENABLED=0
+
+USER taxi
+WORKDIR /srv/taxi
+CMD ["sleep", "infinity"]

@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import (BASE_COLUMNS, FLOAT_COLUMNS, OUTPUT_COLUMNS, TIME_COLUMNS, ZONE_COLUMNS, arrow_schema,
-                    average_speed, bucket_for, canonical_key, parquet_files, write_json)
+                    average_speed, canonical_key, parquet_files, write_json)
 
 
 def files_by_bucket(root):
@@ -29,13 +29,13 @@ def files_by_bucket(root):
     return grouped
 
 
-def encode_row(row, bucket, bucket_count):
+def encode_row(row, bucket, bucket_count, expected_bucket=None):
     if any(row[name] is None for name in OUTPUT_COLUMNS):
         raise ValueError("Unexpected null output value.")
     if any(not math.isfinite(row[name]) for name in FLOAT_COLUMNS):
         raise ValueError("Unexpected NaN/infinite output value.")
     key = canonical_key([row[name] for name in BASE_COLUMNS])
-    if bucket >= 0 and bucket_for(key, bucket_count) != bucket:
+    if bucket >= 0 and expected_bucket != bucket:
         raise ValueError("Row was exported into the wrong hash bucket.")
     duration = row[TIME_COLUMNS[1]] - row[TIME_COLUMNS[0]]
     micros = (duration.days * 86400 + duration.seconds) * 1_000_000 + duration.microseconds
@@ -85,8 +85,14 @@ def compare(left, right, batch_rows=8192):
                         if not parquet.schema_arrow.remove_metadata().equals(arrow_schema("output")):
                             raise ValueError(f"Unexpected output schema in {path}")
                         for batch in parquet.iter_batches(batch_size=batch_rows, columns=OUTPUT_COLUMNS, use_threads=False):
-                            records = [(encode_row(row, bucket, buckets), int(side == 0), int(side == 1))
-                                       for row in batch.to_pylist()]
+                            import pandas as pd
+                            hash_values = pd.util.hash_pandas_object(
+                                batch.select(BASE_COLUMNS).to_pandas(), index=False,
+                                hash_key="0123456789abcdef").to_numpy(dtype="uint64")
+                            expected_buckets = hash_values % buckets
+                            records = [(encode_row(row, bucket, buckets, int(expected_buckets[i])),
+                                        int(side == 0), int(side == 1))
+                                       for i, row in enumerate(batch.to_pylist())]
                             connection.executemany(sql, records)
                             total_rows[side] += len(records)
                     connection.commit()

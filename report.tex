@@ -1,0 +1,114 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.68in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{array}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+\setlength{\leftmargini}{1.2em}
+\newcommand{\shot}[2]{\IfFileExists{artifacts/a3_01/screenshots/#1}{\includegraphics[width=\linewidth,height=1.80in,keepaspectratio]{artifacts/a3_01/screenshots/#1}}{\fbox{\parbox[c][1.80in][c]{0.94\linewidth}{\centering\textbf{Screenshot placeholder}\\#2\\[2pt]\texttt{#1}}}}}
+\newcommand{\smallshot}[2]{\IfFileExists{artifacts/a3_01/screenshots/#1}{\includegraphics[width=\linewidth,height=1.80in,keepaspectratio]{artifacts/a3_01/screenshots/#1}}{\fbox{\parbox[c][1.80in][c]{0.94\linewidth}{\centering\textbf{Screenshot placeholder}\\#2\\\texttt{#1}}}}}
+\title{Taxi Trip Processing with Spark and Ray}
+\author{Harshvardhan Agrawal}
+\date{Assignment 3 \quad | \quad 5 October 2026}
+\begin{document}
+\maketitle
+\vspace{-1.1em}
+\textbf{Objective.} I implemented equivalent NYC Yellow Taxi preprocessing pipelines in Apache Spark and Ray Data, ran them on manually configured two-worker Docker clusters, and checked their complete outputs for exact parity. This report presents one valid full-pipeline run per framework and a separate bounded Python UDF experiment.
+
+\textbf{System and input.} The cluster containers shared one laptop, its disk, CPU, and RAM; this is a local multi-container cluster rather than separate physical machines. The selected deterministic whole-file prefix is January--April 2023: four Parquet files, 12,672,737 raw rows, and 345,261,338 uncompressed row-group bytes (0.345 GB decimal). The downloaded corpus contains 42 months and about 4.019 GB uncompressed. The reduced prefix was chosen after larger Ray runs could not meet the requested runtime budget.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\hline
+ & \textbf{Spark} & \textbf{Ray}\\
+\hline
+Completed run & \texttt{a3\_spark02} & \texttt{a3\_ray08}\\
+Version & Spark 3.5.7 / Python 3.11.15 & Ray 2.49.2 / Python 3.11.15\\
+Cluster & 1 master + 2 workers & 1 head + 2 workers\\
+Input / output rows & 12,672,737 / 12,191,845 & same / same\\
+Buckets / batches / concurrency & 128 / 32,768 / 2 & same / same\\
+Target block size & 32 MiB & 64 MiB\\
+\\\hline
+\end{tabular}
+\end{center}
+
+\textbf{Cluster evidence.} The four captured UI screenshots below show the two Spark workers, the Spark application, and the Ray cluster nodes and job activity.
+\begin{center}
+\begin{minipage}[t]{0.48\linewidth}\centering\shot{spark-master.png}{Spark Master: two active workers}\\[-2pt]\small Spark Master (port 8080)\end{minipage}\hfill
+\begin{minipage}[t]{0.48\linewidth}\centering\shot{spark-app.png}{Spark application and executors}\\[-2pt]\small Spark application UI (port 4040)\end{minipage}\\[5pt]
+\begin{minipage}[t]{0.48\linewidth}\centering\smallshot{ray-nodes.png}{Ray head and two worker nodes}\\[-2pt]\small Ray Nodes / Resources (port 8265)\end{minipage}\hfill
+\begin{minipage}[t]{0.48\linewidth}\centering\smallshot{ray-active.png}{Ray recent jobs and resource activity}\\[-2pt]\small Ray overview (port 8265)\end{minipage}
+\end{center}
+
+\newpage
+\section*{Pipeline and exact parity}
+Both programs read the same sorted whole-file prefix and use the shared cleaning contract. They project the nine trip fields, normalize types and signed zero, reject null, nonfinite, and invalid values, and interpret TLC timestamps as naive wall-clock values at microsecond precision. A fixed-key hash assigns each normalized row to one of 128 deterministic disk buckets. The hash only routes records: exact duplicate removal compares all nine normalized source fields, so collisions do not merge distinct trips.
+
+The staged Parquet data is Snappy-compressed. Spark reads source months separately because their Parquet physical types differ, stages rows by bucket, and deduplicates in one plan. It broadcasts the small taxi-zone lookup on both pickup and drop-off IDs, applies the duration, pickup-hour, and average-speed calculations, then writes bucketed Parquet. Ray reads source files in bounded Arrow batches, stages to the same bucket layout, and assigns one bounded task to each non-empty bucket for exact pandas deduplication. It enriches Arrow batches from the same small zone lookup and writes the equivalent features. Unknown zone IDs are excluded in both implementations.
+
+The output contains the trip fields, pickup/drop-off borough and zone, duration in seconds, pickup hour, and average speed in miles per hour rounded to six decimals. Spark uses the shared Python speed function as a scalar UDF. A first Spark implementation used native rounding and differed from Python on a floating-point halfway value; that run was excluded and the corrected run passed exact validation.
+
+\begin{center}
+\fbox{\parbox{0.93\linewidth}{\centering\textbf{Full output validation: exact match}\\12,191,845 rows from Spark = 12,191,845 rows from Ray; 128 buckets.\\Validator: \texttt{artifacts/a3\_01/parity01.json}.}}
+\end{center}
+
+The fixture test separately exercises cross-file duplicates, schema variation, signed zero, invalid values, fractional timestamps, and unknown zone IDs. Its small Spark and Ray outputs also passed exact comparison. The fixture test supports correctness across edge cases; the full output comparison establishes parity for the measured data.
+
+\section*{Performance and resource use}
+The wall timer covers ingestion through final Parquet export, including disk staging. It excludes cluster start-up, input preflight, dependency installation, validation, and the separate UDF experiment. Each framework has one full measured run; therefore these are single-run observations, not repeated-run averages. CPU and memory are one-second host-wide samples while the corresponding run was active.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\hline
+\textbf{Metric} & \textbf{Spark} & \textbf{Ray}\\
+\hline
+End-to-end time & 115.81 s & 315.17 s\\
+Staging time & 23.36 s & 266.11 s\\
+Peak host CPU & 29.0\% & 13.2\%\\
+Peak host memory & 4.71 GiB & 5.99 GiB\\
+Run samples & 1 & 1\\
+\\\hline
+\end{tabular}
+\end{center}
+
+Spark finished 2.72 times faster and used less peak host memory in this run. Ray's target block was 64 MiB versus Spark's 32 MiB; the input, bucket count, batch rows, concurrency, and two-worker CPU allocation were matched. During Ray's run, a worker task was killed once under memory pressure and retried; Ray also reported 8.2 GiB of object spilling. The job completed and passed exact validation. This points to memory and disk movement as material costs for this Ray configuration. The graphs below show the measured pair; they do not imply a general framework ranking.
+
+\clearpage
+\section*{Pipeline benchmark visuals}
+Each panel summarizes one complete run. The resource peaks are host-wide samples taken once per second during that run; the timing bars cover ingestion through Parquet export.
+\begin{center}
+\includegraphics[width=0.48\linewidth]{artifacts/a3_01/comparison/execution_time.png}\hfill
+\includegraphics[width=0.48\linewidth]{artifacts/a3_01/comparison/resource_peaks.png}
+\end{center}
+
+\newpage
+\section*{Python UDF experiment}
+The custom function computes distance in miles times 3,600 divided by duration in seconds, rounded to six decimal places. Spark applies it through a scalar Python UDF; Ray applies the same function over bounded Arrow batches. The separate profiler used the same parity-validated Spark output as input, materialized the first eight non-empty buckets, ran one warm-up and three measured repetitions, and alternated the native distance-sum baseline with the Python calculation. Timings include scheduling, serialization, and aggregation; baseline subtraction is an estimate and does not isolate language-boundary overhead.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\hline
+\textbf{Framework} & \textbf{Baseline median} & \textbf{Python stage median} & \textbf{Difference}\\
+\hline
+Spark scalar UDF & 2.01 s & 16.32 s & 14.31 s\\
+Ray Arrow-batch UDF & 2.04 s & 2.88 s & 0.84 s\\
+\\\hline
+\end{tabular}
+\end{center}
+\begin{center}
+\includegraphics[width=0.78\linewidth]{artifacts/a3_01/udf_comparison.png}
+\end{center}
+
+For this bounded UDF profile, Ray's Python stage was much faster than Spark's scalar Python stage. The result is consistent with Ray's Python-native batch path avoiding Spark's scalar JVM-to-Python execution boundary, but this experiment includes runtime and aggregation costs and covers only eight buckets. It does not overturn the end-to-end result: Spark was substantially faster for the full ETL run on this hardware.
+
+\section*{Conclusion, limits, and tuning note}
+For this measured BI-style preprocessing workload, Spark is the practical choice: it completed in 115.81 seconds versus Ray's 315.17 seconds and had a lower sampled peak memory. Ray is attractive when Python-native transformations dominate; its Arrow-batch profile was faster here, although the complete Ray pipeline took longer and spilled heavily. These recommendations are limited to one measured pair on a shared laptop, with a reduced 0.345 GB uncompressed input prefix and different framework-specific target block sizes.
+
+\textbf{Performance tuning note.} AI assistance suggested bounded Arrow reads, deterministic disk-backed buckets, limiting concurrent work to fit available memory, and avoiding repeated distributed shuffle plans for each bucket. The shared cleaning contract and exact output validation were retained. Cluster/network configuration was performed manually. All reported pipeline, resource, parity, and UDF values came from actual runs; the earlier cancelled or inexact runs are excluded.
+
+\textbf{Evidence files.} Benchmark metadata and logs are under \texttt{artifacts/a3\_01/}; the run table and plots are in \texttt{comparison/}; parity is recorded in \texttt{parity01.json}; UDF measurements are in \texttt{spark-udf.json}, \texttt{ray-udf.json}, and \texttt{udf\_summary.csv}. The exact run sequence is documented in \texttt{runner.md}.
+\end{document}
